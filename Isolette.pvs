@@ -1,0 +1,455 @@
+Isolette: THEORY
+BEGIN
+  delta: posreal = 0.5 % TR = 0.5 seconds
+  importing Time[delta]
+  importing Hysteresis[delta]
+
+  subrange_real(i: int, j: int): TYPE = {k: real | i <= k AND k <= j}
+
+  % Enumeration types
+  STATUS: TYPE = {valid, invalid}
+  ON_OFF: TYPE = {on, off}
+  MODE:   TYPE = {off, init, normal, failed}
+  ERROR:  TYPE = {err_sensor_failed, err_danger_zone, err_invalid_inputs, ok}
+
+  % ON_OFF bool conversion
+  of2b(x: ON_OFF): bool =
+    COND
+      x = on  -> TRUE,
+      x = off -> FALSE
+    ENDCOND
+  CONVERSION of2b
+
+  % ===============================================================
+  % Monitored Variables
+  % ===============================================================
+  m_tm: VAR [DTIME -> subrange_real(68, 105)]
+  m_dl: VAR [DTIME -> subrange(97, 99)]
+  m_dh: VAR [DTIME -> subrange(98, 100)]
+  m_al: VAR [DTIME -> subrange(93, 98)]
+  m_ah: VAR [DTIME -> subrange(99, 103)]
+  m_st: VAR [DTIME -> STATUS]
+  m_sw: VAR [DTIME -> ON_OFF]
+
+
+  % ===============================================================
+  % Controlled Variables
+  % ===============================================================
+  c_hc: VAR [DTIME -> ON_OFF]
+  c_td: VAR [DTIME -> {k: int | (k = 0) OR (68 <= k AND k <= 105)}]
+  c_al: VAR [DTIME -> ON_OFF]
+  c_md: VAR [DTIME -> MODE]
+  c_ms: VAR [DTIME -> ERROR]
+
+
+
+  % ===============================================================
+  % Environmental assumptions
+  % ===============================================================
+
+
+  increments_of_one(m_dl, m_dh, m_al, m_ah): bool =
+    FORALL (i: POS_DTIME):
+      (member(m_dl(i), (: m_dl(i - 1) - 1, m_dl(i - 1), m_dl(i - 1) + 1 :)))
+      AND
+      (member(m_dh(i), (: m_dh(i - 1) - 1, m_dh(i - 1), m_dh(i - 1) + 1 :)))
+      AND
+      (member(m_al(i), (: m_al(i - 1) - 1, m_al(i - 1), m_al(i - 1) + 1 :)))
+      AND
+      (member(m_ah(i), (: m_ah(i - 1) - 1, m_ah(i - 1), m_ah(i - 1) + 1 :)))
+
+
+
+  % ===============================================================
+  % Function Tables
+  % ===============================================================
+  heat_control_req(c_md, m_tm, m_dl, m_dh, m_al, m_ah, c_hc): bool =
+    FORALL (i: DTIME):
+      COND
+        i = 0 -> c_hc(i) = off,
+        i > 0 ->
+          COND
+            c_md(i) = off
+            OR c_md(i) = failed -> c_hc(i) = off,
+
+      c_md(i) = init
+      OR c_md(i) = normal ->
+              COND
+                (m_dl(i) <= m_al(i)
+          OR m_dh(i) >= m_ah(i)
+          OR m_dh(i) <= m_dl(i)) -> c_hc(i) = off, % invalid monitored variables
+    
+    NOT(m_dl(i) <= m_al(i)
+          OR m_dh(i) >= m_ah(i)
+          OR m_dh(i) <= m_dl(i)) ->
+           COND
+               m_tm(i) < m_dl(i) -> c_hc(i) = on,
+               m_tm(i) >= m_dl(i) -> c_hc(i) = off
+           ENDCOND
+              ENDCOND
+          ENDCOND
+      ENDCOND
+
+  displayed_temperature_req(m_st, m_tm, c_td): bool =
+    FORALL (i: DTIME):
+      COND
+        i >= 0 ->
+          COND
+            m_st(i) = invalid -> c_td(i) = 0,
+            NOT(m_st(i) = invalid) -> c_td(i) = floor(m_tm(i) + 0.5)
+          ENDCOND
+      ENDCOND
+
+  alarm_req(c_md, m_tm, m_dl, m_dh, m_al, m_ah, c_al): bool =
+    FORALL (i: DTIME):
+      COND
+        i = 0 -> c_al(i) = off,
+        i > 0 ->
+          COND
+            c_md(i) = off
+            OR c_md(i) = init -> c_al(i) = off,
+
+            c_md(i) = failed -> c_al(i) = on,
+
+            c_md(i) = normal ->
+              COND
+                (m_dl(i) <= m_al(i)
+        OR m_dh(i) >= m_ah(i)
+        OR m_dh(i) <= m_dl(i)) -> c_al(i) = on,
+
+                NOT(m_dl(i) <= m_al(i)
+        OR m_dh(i) >= m_ah(i)
+        OR m_dh(i) <= m_dl(i)) ->
+                  COND
+                    m_tm(i) > m_ah(i)
+                    OR m_tm(i) < m_al(i) -> c_al(i) = on,
+
+                    (m_al(i) <= m_tm(i)
+                    AND m_tm(i)<= m_al(i) + 0.5)
+                    OR
+                    (m_ah(i) - 0.5 <= m_tm(i)
+                    AND m_tm(i)<= m_ah(i)) -> c_al(i) = c_al(i - 1),
+
+                    (m_al(i) + 0.5 < m_tm(i)
+                    AND m_tm(i) < m_ah(i) - 0.5) ->
+                      COND
+                        held_for(c_al, 10)(i - 1) -> c_al(i) = off,
+                        NOT(held_for(c_al, 10)(i - 1)) -> c_al(i) = c_al(i - 1)
+                      ENDCOND
+                  ENDCOND
+              ENDCOND
+          ENDCOND
+      ENDCOND
+
+  mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md): bool =
+    FORALL (i: DTIME):
+      COND
+        i = 0 -> c_md(i) = off,
+        i > 0 ->
+          COND
+            m_sw(i) = off -> c_md(i) = off,
+            m_sw(i) = on ->
+              COND
+                c_md(i - 1) = off -> c_md(i) = init,
+                c_md(i - 1) = init ->
+                  COND
+                    m_st(i) = valid
+                    AND m_dl(i) <= m_tm(i)
+                    AND m_tm(i) <= m_dh(i) -> c_md(i) = normal,
+
+                    NOT(m_st(i) = valid
+                    AND m_dl(i) <= m_tm(i)
+                    AND m_tm(i) <= m_dh(i)) -> c_md(i) = c_md(i - 1)
+                  ENDCOND,
+
+                c_md(i - 1) = normal ->
+                  COND
+                    m_st(i) = invalid -> c_md(i) = failed,
+                    NOT(m_st(i) = invalid) -> c_md(i) = c_md(i - 1)
+                  ENDCOND,
+
+                c_md(i - 1) = failed ->
+                  COND
+                    m_st(i) = valid -> c_md(i) = normal,
+                    NOT(m_st(i) = valid) -> c_md(i) = c_md(i - 1)
+                  ENDCOND
+              ENDCOND
+          ENDCOND
+      ENDCOND
+
+  message(m_st, m_dl, m_dh, m_al, m_ah, c_md, c_al, c_ms): bool =
+    FORALL (i: DTIME):
+      IF m_st(i) = invalid THEN c_ms(i) = err_sensor_failed
+      ELSIF c_md(i) = normal AND c_al(i) = on THEN c_ms(i) = err_danger_zone
+      ELSIF (m_dl(i) <= m_al(i)
+            OR m_dh(i) >= m_ah(i)
+      OR m_dh(i) <= m_dl(i)) THEN c_ms(i) = err_invalid_inputs
+      ELSE c_ms(i) = ok
+      ENDIF
+
+  % ===============================================================
+  % Mode transition theorems
+  % ===============================================================
+  off_to_init: THEOREM
+    FORALL(i: POS_DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND c_md(i - 1) = off
+      AND m_sw(i) = on
+      IMPLIES
+      c_md(i) = init
+
+  init_to_normal: THEOREM
+    FORALL(i: POS_DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND c_md(i - 1) = init
+      AND m_sw(i) = on
+      AND (m_st(i) = valid
+           AND m_dl(i) <= m_tm(i)
+           AND m_tm(i) <= m_dh(i)
+           AND m_al(i) < m_dl(i)
+           AND m_dl(i) < m_dh(i)
+           AND m_dh(i) < m_ah(i))
+    IMPLIES
+      c_md(i) = normal
+
+  normal_to_failed: THEOREM
+    FORALL(i: POS_DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND c_md(i - 1) = normal
+      AND m_st(i) = invalid
+      AND m_sw(i) = on
+    IMPLIES
+      c_md(i) = failed
+
+  failed_to_normal: THEOREM
+    FORALL(i: POS_DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND c_md(i - 1) = failed
+      AND m_st(i) = valid
+      AND m_sw(i) = on
+    IMPLIES
+      c_md(i) = normal
+
+  not_off_to_off: THEOREM
+    FORALL(i: POS_DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND (member(c_md(i - 1), (: init, normal, failed :)))
+      AND (m_sw(i) = off)
+    IMPLIES
+      c_md(i) = off
+
+
+  % ===============================================================
+  % Validation of the requirements
+  % ===============================================================
+
+  inv_heat_on_below_dl(m_dl, m_dh, m_al, m_ah, m_tm, c_md, c_hc): bool =
+    % below lower desired temperature
+    % (heater on)
+    FORALL(i: POS_DTIME):
+      NOT(m_dl(i) <= m_al(i)
+           OR m_dh(i) >= m_ah(i)
+           OR m_dh(i) <= m_dl(i)) % valid monitored variables
+      AND c_md(i) = normal
+      AND m_tm(i - 1) < m_dl(i - 1)
+      AND c_hc(i - 1) = on
+      AND m_tm(i) < m_dl(i)
+    IMPLIES
+      c_hc(i) = on
+
+  inv_heat_off_above_or_at_dl(m_dl, m_dh, m_al, m_ah, m_tm, c_md, c_hc): bool =
+    % above or equal lower desired temperature
+    % (heater off)
+    FORALL(i: POS_DTIME):
+      NOT(m_dl(i) <= m_al(i)
+           OR m_dh(i) >= m_ah(i)
+           OR m_dh(i) <= m_dl(i)) % valid monitored variables
+      AND c_md(i) = normal
+      AND m_tm(i - 1) < m_dh(i - 1)
+      AND m_dl(i) <= m_tm(i)
+      AND c_hc(i - 1) = on
+    IMPLIES
+      c_hc(i) = off
+
+  inv_alarm_activation(m_tm, m_al, m_ah, m_dl, m_dh, m_st, c_al, c_md, m_sw): bool =
+    FORALL(i: POS_DTIME):
+        i > 0
+      AND (
+        % temperature outside of alarm bounds
+        (c_md(i) = normal
+        AND (m_tm(i) > m_ah(i)
+             OR m_tm(i) < m_al(i)))
+      OR
+        % sensor becomes invalid
+        (m_st(i) = invalid
+         AND m_sw(i) = on AND c_md(i - 1) = normal)
+      OR
+        % invalid input
+        (c_md(i) = normal
+        AND (m_dl(i) <= m_al(i)
+          OR m_dh(i) >= m_ah(i)
+          OR m_dh(i) <= m_dl(i)))
+          )
+    IMPLIES
+      c_al(i) = on
+
+  inv_alarm_deactivation(m_tm, m_al, m_ah, m_dl, m_dh, c_md, c_al): bool =
+    FORALL(i: POS_DTIME):
+      NOT(m_dl(i) <= m_al(i)
+           OR m_dh(i) >= m_ah(i)
+           OR m_dh(i) <= m_dl(i)) % valid monitored variables
+      AND
+     ((held_for(c_al, 10)(i - 1)
+            AND c_md(i) = normal
+            AND m_dl(i) + 0.5 < m_tm(i)
+            AND m_tm(i) < m_dh(i) - 0.5)
+     OR
+      c_md(i) = off)
+      IMPLIES
+  c_al(i) = off
+
+  inv_heat_off_when_off_or_something_wrong(m_dl, m_dh, m_al, m_ah, m_tm, c_md, c_hc): bool =
+    FORALL(i: POS_DTIME):
+      (m_dl(i) <= m_al(i)
+         OR m_dh(i) >= m_ah(i)
+         OR m_dh(i) <= m_dl(i))
+  OR
+   c_md(i) = failed
+  OR
+   c_md(i) = off
+    IMPLIES
+  c_hc(i) = off
+
+  % REQ2
+  spec_implies_heat_maintenance: THEOREM
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND heat_control_req(c_md, m_tm, m_dl, m_dh, m_al, m_ah, c_hc)
+    IMPLIES
+      inv_heat_on_below_dl(m_dl, m_dh, m_al, m_ah, m_tm, c_md, c_hc)
+      AND
+      inv_heat_off_above_or_at_dl(m_dl, m_dh, m_al, m_ah, m_tm, c_md, c_hc)
+
+  % REQ3
+  spec_implies_inv_alarm_activation: THEOREM
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND alarm_req(c_md, m_tm, m_dl, m_dh, m_al, m_ah, c_al)
+    IMPLIES
+      inv_alarm_activation(m_tm, m_al, m_ah, m_dl, m_dh, m_st, c_al, c_md, m_sw)
+
+  % REQ4
+  spec_implies_inv_alarm_deactivation: THEOREM
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND alarm_req(c_md, m_tm, m_dl, m_dh, m_al, m_ah, c_al)
+    IMPLIES
+      inv_alarm_deactivation(m_tm, m_al, m_ah, m_dl, m_dh, c_md, c_al)
+
+  % REQ5
+  spec_implies_inv_heat_off_when_off_or_something_wrong: THEOREM
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND heat_control_req(c_md, m_tm, m_dl, m_dh, m_al, m_ah, c_hc)
+    IMPLIES
+      inv_heat_off_when_off_or_something_wrong(m_dl, m_dh, m_al, m_ah, m_tm, c_md, c_hc)
+
+  % ===============================================================
+  % Use cases
+  % ===============================================================
+
+  usecase1_a: CONJECTURE
+   % the isolette is initially off and is then turned on by the nurse
+   % the isolette begins to initialize
+    FORALL(i: DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND i > 5
+      AND c_md(i - 6) = off
+      AND m_sw(i - 5) = on
+     IMPLIES
+      c_md(i - 5) = init
+
+  usecase1_b: CONJECTURE
+   % the isolette finishes initializing and enters the normal mode
+    FORALL(i: DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND i > 4
+      AND c_md(i - 5) = init
+      AND m_sw(i - 4) = on
+      AND m_st(i - 4) = valid
+      AND (m_dl(i - 4) <= m_tm(i - 4)
+    AND m_tm(i - 4) <= m_dh(i - 4)
+
+    AND m_al(i - 4) + 1 < m_dl(i - 4)
+    AND m_dl(i - 4) < m_dh(i - 4)
+    AND m_dh(i - 4) < m_ah(i - 4))
+     IMPLIES
+      c_md(i - 4) = normal
+
+  usecase1_c: CONJECTURE 
+   % nurse adjusts desired temperature
+    FORALL(i: DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND i > 3
+      AND c_md(i - 4) = normal
+      AND m_sw(i - 3) = on
+      AND m_st(i - 3) = valid
+      AND (m_dl(i - 3) = m_dl(i - 4) - 1
+          AND m_dh(i - 3) = m_dh(i - 4) - 1
+    AND m_al(i - 3) = m_al(i - 4)
+    AND m_ah(i - 3) = m_ah(i - 4))
+     IMPLIES
+      c_md(i - 3) = normal
+
+  usecase1_d: CONJECTURE
+    % after waiting for desired temperature to be maintained,
+    % nurse places baby in the isolette
+    FORALL(i: DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND i > 2
+      AND c_md(i - 3) = normal
+      AND m_sw(i - 2) = on
+      AND m_st(i - 2) = valid
+      AND (m_dl(i - 2) <= m_tm(i - 2)
+          AND m_tm(i - 2) <= m_dl(i - 2))
+     IMPLIES
+      c_md(i - 2) = normal
+
+  usecase1_e: CONJECTURE
+    % desired temperature is maintained with baby inside 
+    FORALL(i: DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND i > 1
+      AND c_md(i - 2) = normal
+      AND m_sw(i - 1) = on
+      AND m_st(i - 1) = valid
+      AND (m_dl(i - 1) <= m_tm(i - 1)
+          AND m_tm(i - 1) <= m_dl(i - 1))
+     IMPLIES
+      c_md(i - 1) = normal
+
+  usecase1_f: CONJECTURE
+   % nurse removes the baby and turns off the isolette
+    FORALL(i: DTIME):
+      mode_req(m_sw, m_st, m_dl, m_dh, m_tm, c_md)
+      AND i > 0
+      AND c_md(i - 1) = normal
+      AND m_sw(i) = off
+     IMPLIES
+      c_md(i) = off
+
+
+  % Use case 2
+  % Nurse setting lower/upper desired and alarm temperatures
+  
+  usecase2_lower_upper_temps: CONJECTURE
+    FORALL(i: POS_DTIME):
+      m_dl(i - 1) = 98
+      AND m_dh(i - 1) = 100
+      AND m_al(i - 1) = 95
+      AND m_ah(i - 1) = 102
+      AND m_dl(i) = 97
+      AND m_dh(i) = 101
+      AND m_al(i) = 96
+      AND m_ah(i) = 103
+    IMPLIES
+      increments_of_one(m_dl, m_dh, m_al, m_ah)
+
+
+END Isolette
